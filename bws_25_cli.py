@@ -9,7 +9,7 @@ import inquirer
 import ntplib
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 
 # try:
     
@@ -347,6 +347,11 @@ class ReservationData:
             Logger.info(f"活动名称：{title}")
             Logger.info(f"预约时间：{reserve_time_str}")
             Logger.info(f"开始时间：{start_time_str}")
+            if '预约只是签售资格，现场签售需购买up主周边。' in activity['describe_info']:
+                warning = "\033[31m【BWS Ticket 提示】注意，该项目可能包含需要付费的内容，请在预约前留意！\033[0m"
+            else:
+                warning = activity['describe_info'].replace('\n', ' ')
+            Logger.info(f"活动提示：{warning}")
             Logger.info("-" * 50)
     
     def get_ticket_for_activity(self, activity_id: int) -> Optional[str]:
@@ -636,7 +641,11 @@ class InteractiveMenu:
             title = activity['act_title'].replace('\n', '')
             reserve_time_str = TimeUtils.timestamp_to_datetime(activity['reserve_begin_time'])
             start_time_str = TimeUtils.timestamp_to_datetime(activity['act_begin_time'])
-            display_text = f"{title} (预约:{reserve_time_str} 开始:{start_time_str})"
+            if '预约只是签售资格，现场签售需购买up主周边。' in activity['describe_info']:
+                warning = "[包含付费内容] "
+            else:
+                warning = ""
+            display_text = f"\033[31m{warning}\033[0m{title} (预约:{reserve_time_str} 开始:{start_time_str})"
             options.append(display_text)
             activity_mapping[i] = activity_id
         
