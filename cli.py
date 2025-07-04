@@ -8,15 +8,15 @@ import sys
 import inquirer
 import ntplib
 from typing import Dict, List, Optional, Tuple
+import qrcode_terminal
+import urllib.parse
+import hashlib
+import qrcode
+from PIL import Image
+import threading
+import io
 
-VERSION = "1.1.2"
-
-# try:
-    
-# except ImportError:
-#     print("需要安装inquirer库: pip install inquirer")
-#     sys.exit(1)
-
+VERSION = "1.2.0"
 
 class Logger:
     """日志管理器"""
@@ -40,9 +40,9 @@ class Logger:
                 console_handler = logging.StreamHandler()
                 console_handler.setLevel(logging.INFO)
                 
-                # 创建格式器
-                file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-                console_formatter = logging.Formatter('%(message)s')
+                # 创建格式器（精确到毫秒）
+                file_formatter = logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+                console_formatter = logging.Formatter('%(asctime)s.%(msecs)03d - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
                 
                 file_handler.setFormatter(file_formatter)
                 console_handler.setFormatter(console_formatter)
@@ -88,7 +88,7 @@ class Logger:
         if not file_only_logger.handlers:
             file_handler = logging.FileHandler('bws_reservation.log', encoding='utf-8')
             file_handler.setLevel(logging.INFO)
-            file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            file_formatter = logging.Formatter('%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
             file_handler.setFormatter(file_formatter)
             file_only_logger.addHandler(file_handler)
         
@@ -105,24 +105,24 @@ class TimeUtils:
     
     @staticmethod
     def set_ntp_mode(use_ntp: bool = True):
-        """设置是否使用NTP时间"""
+        """设置是否使用 NTP 时间"""
         TimeUtils._use_ntp = use_ntp
         if use_ntp:
             TimeUtils._sync_ntp_time()
     
     @staticmethod
     def _sync_ntp_time():
-        """同步NTP时间，计算时间偏移"""
+        """同步 NTP 时间，计算时间偏移"""
         try:
-            # 使用阿里云NTP服务器
+            # 使用阿里云 NTP 服务器
             ntp_client = ntplib.NTPClient()
             response = ntp_client.request('ntp.aliyun.com', version=3)
             ntp_time = response.tx_time
             local_time = time.time()
             TimeUtils._ntp_offset = ntp_time - local_time
-            Logger.info(f"NTP校时成功，时间偏移: {TimeUtils._ntp_offset:.3f}秒")
+            Logger.info(f"NTP 校时成功，时间偏移: {TimeUtils._ntp_offset:.3f}秒")
         except Exception as e:
-            Logger.error(f"NTP校时失败: {e}，将使用本地时间")
+            Logger.error(f"NTP 校时失败: {e}，将使用本地时间")
             TimeUtils._use_ntp = False
             TimeUtils._ntp_offset = 0
     
@@ -199,6 +199,160 @@ class CookieCache:
                 os.remove(cls.CACHE_FILE)
         except Exception as e:
             Logger.error(f"清除Cookie缓存失败: {e}")
+
+
+class QRCodeLogin:
+    """二维码登录功能类"""
+    
+    @staticmethod
+    def tvsign(params, appkey='4409e2ce8ffd12b8', appsec='59b43e04ad6965f34319062b478f83dd'):
+        """为请求参数进行 api 签名"""
+        params.update({'appkey': appkey})
+        params = dict(sorted(params.items()))  # 重排序参数 key
+        query = urllib.parse.urlencode(params)  # 序列化参数
+        sign = hashlib.md5((query+appsec).encode()).hexdigest()  # 计算 api 签名
+        params.update({'sign': sign})
+        return params
+    
+    @staticmethod
+    def show_qr_popup(qr_url):
+        """直接打开二维码图片"""
+        def show_image():
+            try:
+                # 生成二维码图片
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=qrcode.constants.ERROR_CORRECT_L,
+                    box_size=10,
+                    border=4,
+                )
+                qr.add_data(qr_url)
+                qr.make(fit=True)
+                
+                # 创建二维码图片
+                qr_img = qr.make_image(fill_color="black", back_color="white")
+                
+                # 直接显示图片（会使用系统默认图片查看器打开）
+                qr_img.show()
+                    
+            except Exception as e:
+                Logger.error(f"显示二维码图片失败: {e}")
+        
+        # 在新线程中显示图片，避免阻塞主程序
+        show_thread = threading.Thread(target=show_image, daemon=True)
+        show_thread.start()
+        return show_thread
+    
+    @staticmethod
+    def login_with_qrcode():
+        """通过二维码登录获取Cookie"""
+        try:
+            Logger.info("正在获取二维码...")
+            
+            # 获取二维码
+            loginInfo = requests.post(
+                'https://passport.bilibili.com/x/passport-tv-login/qrcode/auth_code',
+                params=QRCodeLogin.tvsign({
+                    'local_id': '0',
+                    'ts': int(time.time())
+                }),
+                headers={
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                },
+                timeout=10
+            ).json()
+            
+            if loginInfo.get('code') != 0:
+                Logger.error(f"获取二维码失败: {loginInfo.get('message', '未知错误')}")
+                return None
+            
+            # 生成二维码
+            print("\n请使用哔哩哔哩手机客户端扫描以下二维码登录：")
+            print("="*60)
+            qrcode_terminal.draw(loginInfo['data']['url'])
+            print("="*60)
+            
+            # 同时打开二维码图片
+            Logger.info("正在打开二维码图片...")
+            QRCodeLogin.show_qr_popup(loginInfo['data']['url'])
+            
+            Logger.info("等待扫码登录...")
+            
+            # 轮询登录状态
+            auth_code = loginInfo['data']['auth_code']
+            while True:
+                try:
+                    pollInfo = requests.post(
+                        'https://passport.bilibili.com/x/passport-tv-login/qrcode/poll',
+                        params=QRCodeLogin.tvsign({
+                            'auth_code': auth_code,
+                            'local_id': '0',
+                            'ts': int(time.time())
+                        }),
+                        headers={
+                            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                        },
+                        timeout=10
+                    ).json()
+                    
+                    if pollInfo['code'] == 0:
+                        # 登录成功
+                        loginData = pollInfo['data']
+                        Logger.info(f"登录成功！有效期至 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + int(loginData['expires_in'])))}")
+                        
+                        # 提取Cookie信息
+                        cookie_info = loginData.get('cookie_info', {})
+                        cookies = cookie_info.get('cookies', [])
+                        
+                        # 构建Cookie字符串
+                        cookie_parts = []
+                        for cookie in cookies:
+                            cookie_parts.append(f"{cookie['name']}={cookie['value']}")
+                        
+                        cookie_string = '; '.join(cookie_parts)
+                        
+                        if not cookie_string:
+                            Logger.error("获取Cookie失败：登录响应中没有Cookie信息")
+                            return None
+                        
+                        # 验证Cookie有效性
+                        api_client = BilibiliAPI(cookie_string)
+                        if api_client.validate_cookie():
+                            Logger.info("Cookie验证成功，正在保存到缓存...")
+                            CookieCache.save_cookie(cookie_string)
+                            return cookie_string
+                        else:
+                            Logger.error("获取的Cookie无效")
+                            return None
+                        
+                    elif pollInfo['code'] == -3:
+                        Logger.error('API校验密匙错误')
+                        return None
+                    elif pollInfo['code'] == -400:
+                        Logger.error('请求错误')
+                        return None
+                    elif pollInfo['code'] == 86038:
+                        Logger.error('二维码已失效，请重新获取')
+                        return None
+                    elif pollInfo['code'] == 86039:
+                        # 二维码未确认，继续等待
+                        time.sleep(2)
+                        continue
+                    else:
+                        Logger.error(f'未知错误: {pollInfo.get("message", "未知错误")}')
+                        return None
+                        
+                except requests.RequestException as e:
+                    Logger.error(f"网络请求失败: {e}")
+                    time.sleep(2)
+                    continue
+                except KeyboardInterrupt:
+                    Logger.info("\n用户取消扫码登录")
+                    return None
+                    
+        except Exception as e:
+            Logger.error(f"扫码登录过程中发生错误: {e}")
+            return None
 
 
 class BilibiliAPI:
@@ -409,7 +563,7 @@ class ReservationBot:
                 auto_sync_done = True
                 Logger.info("开抢前 5 分钟，正在进行自动 NTP 校时...")
                 
-                # 记录校时前的时间（如果已启用NTP则使用当前NTP时间，否则使用本机时间）
+                # 记录校时前的时间（如果已启用 NTP 则使用当前 NTP 时间，否则使用本机时间）
                 time_before = TimeUtils.get_current_time()
                 local_time_before = time.time()  # 始终记录本机时间用于显示真实的本机与NTP差异
                 
@@ -550,7 +704,7 @@ class ReservationBot:
     
     def _start_reservation_loop(self, ticket_number: str, activity_id: int, activity_title: str) -> None:
         """开始预约循环"""
-        Logger.info(f"开始抢票：{activity_title}")
+        Logger.info(f"开始抢票：{activity_title}\n")
         
         while True:
             try:
@@ -645,7 +799,7 @@ class InteractiveMenu:
                 warning = "[包含付费内容] "
             else:
                 warning = ""
-            display_text = f"\033[31m{warning}\033[0m{title} (预约:{reserve_time_str} 开始:{start_time_str})"
+            display_text = f"\033[31m{warning}\033[0m{title} | 预约开始 {reserve_time_str} | 活动时间 {start_time_str}"
             options.append(display_text)
             activity_mapping[i] = activity_id
         
@@ -692,10 +846,7 @@ class UserInterface:
         Logger.info(f'当前程序版本：{VERSION} | 本工具在 Starsbon/bws_ticket 开源，欢迎 Star！')
         Logger.info('')
     
-    @staticmethod
-    def get_cookie_input() -> str:
-        """获取Cookie输入"""
-        return input("请输入你的 B 站 Cookies：")
+
     
     @staticmethod
     def get_valid_cookie() -> str:
@@ -712,26 +863,58 @@ class UserInterface:
                     Logger.info("Cookie 缓存有效，直接使用缓存登录\n")
                     return cached_cookie
                 else:
-                    Logger.warning("Cookie 缓存已失效，需要重新输入\n")
+                    Logger.warning("Cookie 缓存已失效，需要重新登录\n")
                     CookieCache.clear_cache()
             except Exception as e:
                 Logger.error(f"验证 Cookie 缓存时出错: {e}")
                 CookieCache.clear_cache()
         
-        # 获取新的Cookie
+        # 如果没有缓存或缓存失效，提供登录选项
         while True:
-            cookie_string = UserInterface.get_cookie_input()
             try:
-                # 验证新输入的Cookie
-                api_client = BilibiliAPI(cookie_string)
-                if api_client.validate_cookie():
-                    Logger.info("Cookie 验证成功，正在保存到缓存...\n")
-                    CookieCache.save_cookie(cookie_string)
-                    return cookie_string
-                else:
-                    Logger.warning("Cookie 无效，请重新输入")
+                login_options = [
+                    "扫码登录（推荐）",
+                    "手动输入Cookie"
+                ]
+                
+                selected_index = InteractiveMenu.show_menu("请选择登录方式", login_options)
+                
+                if selected_index == -1:  # ESC退出
+                    Logger.info("用户取消登录")
+                    exit(0)
+                elif selected_index == 0:  # 扫码登录
+                    Logger.info("选择扫码登录方式")
+                    cookie_string = QRCodeLogin.login_with_qrcode()
+                    if cookie_string:
+                        return cookie_string
+                    else:
+                        Logger.warning("扫码登录失败，请重试或选择其他登录方式")
+                        continue
+                elif selected_index == 1:  # 手动输入Cookie
+                    Logger.info("选择手动输入Cookie方式")
+                    Logger.info("获取方法：登录bilibili.com后，按F12打开开发者工具，在Network标签页找到任意请求，复制Cookie值")
+                    
+                    cookie_string = input('请输入Cookie: ').strip()
+                    if not cookie_string:
+                        Logger.warning("Cookie不能为空，请重新选择登录方式")
+                        continue
+                    
+                    # 验证Cookie
+                    api_client = BilibiliAPI(cookie_string)
+                    if api_client.validate_cookie():
+                        Logger.info("Cookie 验证成功，正在保存到缓存...\n")
+                        CookieCache.save_cookie(cookie_string)
+                        return cookie_string
+                    else:
+                        Logger.warning("Cookie 无效，请重新选择登录方式")
+                        continue
+                        
+            except KeyboardInterrupt:
+                Logger.info("\n用户取消登录")
+                exit(0)
             except Exception as e:
-                Logger.error(f"Cookie 验证失败: {e}，请重新输入")
+                Logger.error(f"登录过程中发生错误: {e}，请重试")
+                continue
     
     # @staticmethod
     # def get_activity_selection(activity_mapping: Dict[int, Tuple[str, int, int]]) -> int:
@@ -861,12 +1044,12 @@ def main():
                 activity_title = reservation_data.activity_mapping[selected_activity_id][0]
                 mode_text = "准时开抢" if reservation_mode == "scheduled" else "直接开抢"
                 
-                print("\n" + "="*60)
-                print("预约确认")
-                print("="*60)
-                print(f"活动名称：{activity_title}")
-                print(f"预约模式：{mode_text}")
-                print("按 Ctrl+C 可以中断抢票")
+                # print("\n" + "="*60)
+                # print("预约确认")
+                # print("="*60)
+                # print(f"活动名称：{activity_title}")
+                # print(f"预约模式：{mode_text}")
+                # print("按 Ctrl+C 可以中断抢票")
                 
                 # 使用 inquirer 进行确认
                 try:
@@ -895,7 +1078,7 @@ def main():
             elif selected_index == 3:  # 时间校时设置
                 time_options = [
                     "使用本地时间",
-                    "使用NTP时间 (阿里云服务器校时)"
+                    "使用 Aliyun NTP 时间"
                 ]
                 
                 current_mode = 1 if TimeUtils._use_ntp else 0
