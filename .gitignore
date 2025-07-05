@@ -1,0 +1,34 @@
+# JSON 文件
+*.json
+
+# 日志文件
+*.log
+logs/
+log/
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# pipenv
+Pipfile
+
+# pyinstaller
+*.spec

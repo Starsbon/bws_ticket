@@ -1,0 +1,14 @@
+[[source]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+verify_ssl = true
+name = "pip_conf_index_global"
+
+[packages]
+requests = ">=2.25.0"
+keyboard = ">=0.13.5"
+inquirer = ">=3.1.0"
+
+[dev-packages]
+
+[requires]
+python_version = "3.11"
