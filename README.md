@@ -1,5 +1,5 @@
 # 哔哩哔哩 BWS（BW乐园）活动预约工具
-> 没票用不了，只要叔叔不改风控就能用，理解万岁！
+> 没票用不了，只要叔叔不改风控就能用，理解万岁。我们明年 BW 2026 有缘再见！
 
 ### 版本说明
 - 支持扫码登录
@@ -8,7 +8,7 @@
 - 支持二次付费项目显示（如签售）
 
 ### 下载链接
-[点击右侧 Releases](https://github.com/Starsbon/bws_ticket/releases) 或 [这个链接 https://github.com/Starsbon/bws_ticket/releases](https://github.com/Starsbon/bws_ticket/releases) 前往下载
+**点击右侧 Releases 或 [这个链接 https://github.com/Starsbon/bws_ticket/releases](https://github.com/Starsbon/bws_ticket/releases) 前往下载**
 
 ------
 
