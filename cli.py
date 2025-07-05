@@ -7,7 +7,7 @@ import logging
 import sys
 import inquirer
 import ntplib
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 import qrcode_terminal
 import urllib.parse
 import hashlib
@@ -15,8 +15,10 @@ import qrcode
 from PIL import Image
 import threading
 import io
+from rich.console import Console
+from rich.table import Table
 
-VERSION = "1.4.2"
+VERSION = "1.5.0"
 
 class Logger:
     """日志管理器"""
@@ -147,13 +149,19 @@ class ConfigManager:
         "开票前延迟设置": {
             "start_delay_ms": 0  # 开票前延时（毫秒）
         },
+        "开抢中延迟设置": {
+            "loop_delay_ms": 0  # 开抢中延时（毫秒）
+        },
         "retry_intervals": {
             "normal": 0.25,
             "rate_limit": 0.5,
             "not_open": 1.0
         },
         "max_retries": 1000,
-        "request_timeout": 10
+        "request_timeout": 10,
+        "活动过滤设置": {
+            "hide_ended_reservations": False  # 屏蔽已结束预约活动（state: 3）
+        }
     }
     
     @classmethod
@@ -467,6 +475,26 @@ class BilibiliAPI:
             Logger.log_to_file_only(f"网络请求失败: {e}", 'ERROR')
             return error_result
     
+    def get_my_reservations(self) -> Optional[Dict]:
+        """获取我的预约信息"""
+        url = "https://api.bilibili.com/x/activity/bws/online/park/myreserve"
+        params = {
+            "csrf": self.csrf_token
+        }
+        
+        try:
+            response = self.session.get(url, params=params, cookies=self.cookies)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result['code'] != 0:
+                Logger.error(f"API错误: {result['code']} 消息: {result['message']}")
+                return None
+            return result['data']
+        except requests.RequestException as e:
+            Logger.error(f"网络请求失败: {e}")
+            return None
+    
     def validate_cookie(self) -> bool:
         """验证Cookie是否有效"""
         try:
@@ -480,11 +508,13 @@ class BilibiliAPI:
 class ReservationData:
     """预约数据管理类"""
     
-    def __init__(self, reservation_info: Dict):
+    def __init__(self, reservation_info: Dict, my_reservations: Optional[Dict] = None):
         self.raw_data = reservation_info
+        self.my_reservations = my_reservations
         self.ticket_days = list(reservation_info['user_reserve_info'].keys())
         self.ticket_mapping = self._build_ticket_mapping()
         self.activity_mapping = self._build_activity_mapping()
+        self.reserved_activity_ids = self._build_reserved_activity_mapping()
     
     def _build_ticket_mapping(self) -> Dict[str, str]:
         """构建日期到票号的映射"""
@@ -503,24 +533,90 @@ class ReservationData:
                 activity_map[activity_id] = (title, start_time, reserve_time)
         return activity_map
     
+    def _build_reserved_activity_mapping(self) -> Set[int]:
+        """构建用户已预约活动ID的集合"""
+        reserved_ids = set()
+        if self.my_reservations and 'reserve_list' in self.my_reservations:
+            for date_activities in self.my_reservations['reserve_list'].values():
+                for activity in date_activities:
+                    reserved_ids.add(activity['reserve_id'])
+        return reserved_ids
+    
     def display_ticket_info(self) -> None:
         """显示购票信息"""
         Logger.info("当前账号 BW 购票信息：")
+        
+        # 创建表格
+        console = Console()
+        table = Table(show_header=True, header_style="bold magenta", box=None)
+        table.add_column("活动名称", style="cyan")
+        table.add_column("票种", style="green")
+        table.add_column("电子票号", style="yellow")
+        
+        # 添加数据
         for day in self.ticket_days:
             ticket_info = self.raw_data['user_ticket_info'][day]
-            Logger.info(f"{ticket_info['screen_name']} | 票种：{ticket_info['sku_name']} | 电子票号：{ticket_info['ticket']}")
+            table.add_row(
+                ticket_info['screen_name'],
+                ticket_info['sku_name'],
+                ticket_info['ticket']
+            )
+        
+        # 显示表格
+        with console.capture() as capture:
+            console.print(table)
+        Logger.info(f"\n{capture.get()}")
     
     def display_activities(self) -> None:
         """显示活动信息"""
         Logger.info('')
+        
+        # 加载配置
+        config = ConfigManager.load_config()
+        hide_ended = config.get('活动过滤设置', {}).get('hide_ended_reservations', False)
+        
+        # 创建表格
+        console = Console()
+        table = Table(show_header=True, header_style="bold magenta", box=None)
+        table.add_column("ID", style="cyan")
+        table.add_column("活动名称", style="green")
+        table.add_column("预约时间", style="yellow")
+        table.add_column("开始时间", style="blue")
+        
+        # 添加数据
+        filtered_count = 0
         for day in self.ticket_days:
             for activity in self.raw_data['reserve_list'][day]:
                 activity_id = activity['reserve_id']
+                
+                # 检查是否需要过滤已结束预约的活动或用户已预约的活动
+                if hide_ended and (activity.get('state') == 3 or activity_id in self.reserved_activity_ids):
+                    filtered_count += 1
+                    continue
                 title = activity['act_title'].replace('\n', '')
                 reserve_time_str = TimeUtils.timestamp_to_datetime(activity['reserve_begin_time'])
                 start_time_str = TimeUtils.timestamp_to_datetime(activity['act_begin_time'])
-                Logger.info(f"活动代码：{activity_id}  {title} 预约：{reserve_time_str} 开始：{start_time_str}")
-            Logger.info('')
+                
+                # 检查是否为二次付费活动
+                if '预约只是签售资格，现场签售需购买up主周边。' in activity['describe_info']:
+                    title = f"[red][需付费] [/red]{title}"
+                
+                table.add_row(
+                    str(activity_id),
+                    title,
+                    reserve_time_str,
+                    start_time_str
+                )
+        
+        # 显示表格
+        with console.capture() as capture:
+            console.print(table)
+        
+        result_info = f"\n{capture.get()}\n"
+        if hide_ended and filtered_count > 0:
+            result_info += f"\n已屏蔽 {filtered_count} 个已结束预约或已预约的活动\n"
+        
+        Logger.info(result_info)
     
     def display_activities_for_date(self, selected_date: str) -> None:
         """显示指定日期的活动信息"""
@@ -528,26 +624,83 @@ class ReservationData:
             Logger.error(f"未找到日期 {selected_date} 的活动信息")
             return
         
-        ticket_info = self.raw_data['user_ticket_info'][selected_date]
-        Logger.info(f"\n{ticket_info['screen_name']} - {ticket_info['sku_name']}")
-        Logger.info(f"电子票号：{ticket_info['ticket']}\n")
+        # 加载配置
+        config = ConfigManager.load_config()
+        hide_ended = config.get('活动过滤设置', {}).get('hide_ended_reservations', False)
         
+        ticket_info = self.raw_data['user_ticket_info'][selected_date]
+        
+        # 显示票务信息表格
+        console = Console()
+        ticket_table = Table(show_header=True, header_style="bold magenta", box=None)
+        ticket_table.add_column("活动名称", style="cyan")
+        ticket_table.add_column("票种", style="green")
+        ticket_table.add_column("电子票号", style="yellow")
+        
+        ticket_table.add_row(
+            ticket_info['screen_name'],
+            ticket_info['sku_name'],
+            ticket_info['ticket']
+        )
+        
+        with console.capture() as capture:
+            console.print(ticket_table)
+        Logger.info(f"\n票务信息：\n{capture.get()}\n")
+        
+        # 准备活动信息表格数据
         activities = self.raw_data['reserve_list'][selected_date]
+        activity_data = []
+        filtered_count = 0
+        
         for activity in activities:
             activity_id = activity['reserve_id']
+            
+            # 检查是否需要过滤已结束预约的活动或用户已预约的活动
+            if hide_ended and (activity.get('state') == 3 or activity_id in self.reserved_activity_ids):
+                filtered_count += 1
+                continue
             title = activity['act_title'].replace('\n', '')
             reserve_time_str = TimeUtils.timestamp_to_datetime(activity['reserve_begin_time'])
             start_time_str = TimeUtils.timestamp_to_datetime(activity['act_begin_time'])
-            Logger.info(f"活动代码：{activity_id}")
-            Logger.info(f"活动名称：{title}")
-            Logger.info(f"预约时间：{reserve_time_str}")
-            Logger.info(f"开始时间：{start_time_str}")
+            
+            # 检查是否为二次付费活动
             if '预约只是签售资格，现场签售需购买up主周边。' in activity['describe_info']:
-                warning = "\033[31m【BWS Ticket 提示】注意，该项目可能包含需要付费的内容，请在预约前留意！\033[0m"
-            else:
-                warning = activity['describe_info'].replace('\n', ' ')
-            Logger.info(f"活动提示：{warning}")
-            Logger.info("-" * 50)
+                title = f"[red][需付费] [/red]{title}"
+            
+            # 处理活动提示信息，直接在活动名称中换行显示，设置描述文字为白色
+            warning = activity['describe_info'].replace('\n', ' ')[:50] + ('...' if len(activity['describe_info']) > 50 else '')
+            title_with_warning = f"{title}\n[white]{warning}[/white]"
+            
+            activity_data.append([
+                activity_id,
+                title_with_warning,
+                reserve_time_str,
+                start_time_str
+            ])
+        
+        # 显示活动信息表格
+        activity_table = Table(show_header=True, header_style="bold magenta", box=None)
+        activity_table.add_column("ID", style="cyan")
+        activity_table.add_column("活动名称", style="green")
+        activity_table.add_column("预约时间", style="yellow")
+        activity_table.add_column("开始时间", style="blue")
+        
+        for data in activity_data:
+            activity_table.add_row(
+                str(data[0]),
+                data[1],
+                data[2],
+                data[3]
+            )
+        
+        with console.capture() as capture:
+            console.print(activity_table)
+        
+        result_info = f"活动信息：\n{capture.get()}\n"
+        if hide_ended and filtered_count > 0:
+            result_info += f"\n已屏蔽 {filtered_count} 个已结束预约或已预约的活动\n"
+        
+        Logger.info(result_info)
     
     def get_ticket_for_activity(self, activity_id: int) -> Optional[str]:
         """根据活动ID获取对应的票号"""
@@ -557,6 +710,70 @@ class ReservationData:
         activity_start_time = self.activity_mapping[activity_id][1]
         activity_date = datetime.datetime.fromtimestamp(activity_start_time).strftime("%Y%m%d")
         return self.ticket_mapping.get(activity_date)
+    
+    @staticmethod
+    def display_my_reservations(my_reservations_data: Dict) -> None:
+        """显示我的预约信息"""
+        if not my_reservations_data or 'reserve_list' not in my_reservations_data:
+            Logger.info("暂无预约信息")
+            return
+        
+        reserve_list = my_reservations_data['reserve_list']
+        if not reserve_list:
+            Logger.info("暂无预约信息")
+            return
+        
+        Logger.info("我的预约信息：")
+        
+        # 创建表格
+        console = Console()
+        table = Table(show_header=True, header_style="bold magenta", box=None)
+        table.add_column("日期", style="cyan")
+        table.add_column("活动名称", style="green")
+        table.add_column("预约号", style="yellow")
+        table.add_column("活动时间", style="blue")
+        table.add_column("地点", style="magenta")
+        table.add_column("状态", style="red")
+        
+        # 按日期排序并添加数据
+        for date in sorted(reserve_list.keys()):
+            activities = reserve_list[date]
+            for activity in activities:
+                activity_title = activity['act_title'].replace('\n', '')
+                
+                # 检查是否为二次付费活动
+                if '预约只是签售资格，现场签售需购买up主周边。' in activity['describe_info']:
+                    activity_title = f"[red][需付费] [/red]{activity_title}"
+                
+                reserve_no = f"#{activity['reserve_no']}"
+                act_time = f"{TimeUtils.timestamp_to_datetime(activity['act_begin_time'])} - {TimeUtils.timestamp_to_datetime(activity['act_end_time'])}"
+                location = activity.get('reserve_location', '未知')
+                
+                # 根据活动类型显示状态
+                if activity.get('is_checked') == 1:
+                    status = "[green]已签到[/green]"
+                elif activity.get('online_state') == 0:
+                    status = "[yellow]预约成功[/yellow]"
+                else:
+                    status = "[blue]待确认[/blue]"
+                
+                table.add_row(
+                    date,
+                    activity_title,
+                    reserve_no,
+                    act_time,
+                    location,
+                    status
+                )
+        
+        # 显示表格
+        with console.capture() as capture:
+            console.print(table)
+        Logger.info(f"\n{capture.get()}\n")
+        
+        # 显示统计信息
+        total_count = sum(len(activities) for activities in reserve_list.values())
+        Logger.info(f"总计预约活动数量：{total_count} 个")
 
 
 class ReservationBot:
@@ -582,14 +799,11 @@ class ReservationBot:
             Logger.error(f"无法找到活动 {activity_id} 对应的票号")
             return
         
-        Logger.info(f'一次抢一个，如果觉得抢的少请自行多开。')
-        Logger.info(f'开始预约：{activity_title}')
-        
         if mode == "immediate":
-            Logger.info("直接开抢模式：立即开始抢票")
+            Logger.info("当前为立即开抢模式，即将开始抢票！")
             self._start_reservation_loop(ticket_number, activity_id, activity_title)
         else:
-            Logger.info("准时开抢模式：等待预约时间")
+            Logger.info("当前为准时开抢模式，等待预约时间...")
             self._wait_for_reservation_time(ticket_number, activity_id, activity_title, reserve_time)
     
     def _wait_for_reservation_time(self, ticket_number: str, activity_id: int, activity_title: str, reserve_time: int) -> None:
@@ -651,10 +865,15 @@ class ReservationBot:
             
             # 等待到达目标开抢时间
             if current_time < target_time:
-                if (current_time > last_status_time + 3 and 
-                    last_status_time + 30 < target_time):
+                remaining_seconds = target_time - current_time
+                
+                # 开票前5秒停止输出倒计时，并显示待抢状态提示
+                if remaining_seconds <= 5:
+                    if last_status_time == 0 or current_time > last_status_time + 1:  # 只打印一次或每秒更新一次
+                        last_status_time = current_time
+                        Logger.info("即将开始抢票，进入待抢状态，不再输出倒计时")
+                elif (current_time > last_status_time + 3):
                     last_status_time = current_time
-                    remaining_seconds = target_time - current_time
                     reserve_time_str = TimeUtils.timestamp_to_datetime(reserve_time)
                     time_source = "NTP 时间" if TimeUtils._use_ntp else "本地时间"
                     if delay_ms > 0:
@@ -678,110 +897,13 @@ class ReservationBot:
             self._start_reservation_loop(ticket_number, activity_id, activity_title)
             break
     
-    def _simulate_wait_for_reservation_time(self, ticket_number: str, activity_id: int, activity_title: str, reserve_time: int) -> None:
-        """模拟等待预约时间到达（测试用）"""
-        last_status_time = 0
-        auto_sync_done = False
-        
-        Logger.info("=== 模拟测试模式 ===")
-        Logger.info("此模式仅用于测试 NTP 校时功能，不会执行真正的抢票操作")
-        
-        while True:
-            current_time = int(TimeUtils.get_current_time())
-            
-            # 开抢前5分钟自动校时（模拟）
-            if not auto_sync_done and current_time >= reserve_time - 300:  # 5分钟 = 300秒
-                auto_sync_done = True
-                Logger.info("[模拟] 开抢前5分钟，正在进行自动NTP校时...")
-                
-                # 记录校时前的时间（如果已启用NTP则使用当前NTP时间，否则使用本机时间）
-                time_before = TimeUtils.get_current_time()
-                local_time_before = time.time()  # 始终记录本机时间用于显示真实的本机与NTP差异
-                
-                # 执行NTP校时
-                try:
-                    ntp_client = ntplib.NTPClient()
-                    response = ntp_client.request('ntp.aliyun.com', version=3)
-                    ntp_time = response.tx_time
-                    
-                    # 计算本机时间与NTP服务器的真实时间差（用于显示）
-                    real_time_diff = ntp_time - local_time_before
-                    
-                    # 计算新的NTP偏移（基于本机时间）
-                    new_ntp_offset = ntp_time - local_time_before
-                    
-                    # 显示详细的时间信息（测试模式）
-                    current_program_time = TimeUtils.get_current_time()
-                    current_local_time = time.time()
-                    
-                    Logger.info(f"[模拟] === 时间信息详情 ===")
-                    Logger.info(f"[模拟] 程序时间: {TimeUtils.timestamp_to_datetime(current_program_time)}")
-                    Logger.info(f"[模拟] NTP 时间:  {TimeUtils.timestamp_to_datetime(ntp_time)}")
-                    Logger.info(f"[模拟] 本机时间: {TimeUtils.timestamp_to_datetime(current_local_time)}")
-                    Logger.info(f"[模拟] 本机与 NTP 时间差: {real_time_diff:.3f}秒")
-                    
-                    if abs(real_time_diff) < 1:
-                        Logger.info(f"[模拟] NTP 校时完成 (时间同步良好)")
-                    else:
-                        Logger.info(f"[模拟] NTP 校时完成 (建议检查系统时间)")
-                    
-                    # 如果用户未开启NTP模式，根据时间差决定是否临时应用校时
-                    if not TimeUtils._use_ntp:
-                        if abs(real_time_diff) > 0.7:
-                            TimeUtils._ntp_offset = new_ntp_offset
-                            TimeUtils._use_ntp = True
-                            Logger.info(f"[模拟] 本机时间偏差较大({real_time_diff:.3f}秒)，已临时启用 NTP 校时模式")
-                        else:
-                            Logger.info(f"[模拟] 本机时间偏差较小({real_time_diff:.3f}秒)，继续使用本机时间")
-                    else:
-                        # 更新现有的NTP偏移
-                        old_offset = TimeUtils._ntp_offset
-                        TimeUtils._ntp_offset = new_ntp_offset
-                        offset_change = new_ntp_offset - old_offset
-                        Logger.info(f"[模拟] 已更新 NTP 时间偏移 (偏移变化: {offset_change:.3f}秒)")
-                        
-                except Exception as e:
-                    Logger.warning(f"[模拟] 自动 NTP 校时失败: {e}，将使用当前时间模式")
-            
-            # 计算开票前延迟设置（支持负数提前抢票）
-            config = ConfigManager.load_config()
-            start_delay_ms = config.get('开票前延迟设置', {}).get('start_delay_ms', 0)
-            target_time = reserve_time + (start_delay_ms / 1000.0)  # 目标开抢时间
-            
-            # 等待到达目标开抢时间
-            if current_time < target_time:
-                if (current_time > last_status_time + 3 and 
-                    last_status_time + 30 < target_time):
-                    last_status_time = current_time
-                    remaining_seconds = target_time - current_time
-                    reserve_time_str = TimeUtils.timestamp_to_datetime(reserve_time)
-                    time_source = "NTP时间" if TimeUtils._use_ntp else "本地时间"
-                    if start_delay_ms > 0:
-                        Logger.info(f'[模拟] 等待开票，当前预约活动：{activity_title} | 开票时间：{reserve_time_str} | 延迟：{start_delay_ms}ms | 剩余：{remaining_seconds:.1f}秒 ({time_source})')
-                    elif start_delay_ms < 0:
-                        Logger.info(f'[模拟] 等待开票，当前预约活动：{activity_title} | 开票时间：{reserve_time_str} | 提前：{-start_delay_ms}ms | 剩余：{remaining_seconds:.1f}秒 ({time_source})')
-                    else:
-                        Logger.info(f'[模拟] 等待开票，当前预约活动：{activity_title} | 开票时间：{reserve_time_str} | 剩余：{remaining_seconds:.1f}秒 ({time_source})')
-                time.sleep(0.1)
-                continue
-            
-            # 到达目标时间，开始模拟抢票
-            if start_delay_ms > 0:
-                Logger.info(f"[模拟] 开票时间已到，延时 {start_delay_ms} 毫秒后开始抢票...")
-                time.sleep(start_delay_ms / 1000.0)  # 转换为秒
-                Logger.info(f"[模拟] 延时结束，模拟开始抢票：{activity_title}")
-            elif start_delay_ms < 0:
-                Logger.info(f"[模拟] 提前 {-start_delay_ms} 毫秒开始抢票：{activity_title}")
-            else:
-                Logger.info(f"[模拟] 开票时间已到，模拟开始抢票：{activity_title}")
-            
-            Logger.info("[模拟] 这是测试模式，未执行真正的抢票操作")
-            Logger.info("[模拟] 测试完成！NTP 校时功能工作正常")
-            break
-    
+
     def _start_reservation_loop(self, ticket_number: str, activity_id: int, activity_title: str) -> None:
         """开始预约循环"""
-        Logger.info(f"开始抢票：{activity_title}\n")
+        # 获取开抢中延迟设置
+        config = ConfigManager.load_config()
+        loop_delay_ms = config.get('开抢中延迟设置', {}).get('loop_delay_ms', 50)
+        loop_delay_seconds = loop_delay_ms / 1000.0
         
         while True:
             try:
@@ -815,7 +937,9 @@ class ReservationBot:
                 else:
                     Logger.warning(f"出金了，是新的未知状态，请自行判断：{result}")
                 
-                time.sleep(0.05)
+                # 使用配置的开抢中延迟
+                if loop_delay_seconds > 0:
+                    time.sleep(loop_delay_seconds)
             except KeyboardInterrupt:
                 Logger.info("用户中断抢票")
                 break
@@ -878,29 +1002,86 @@ class InteractiveMenu:
     @staticmethod
     def show_activity_menu(reservation_data, selected_date: str) -> int:
         """显示活动选择菜单"""
+        activities = reservation_data.raw_data['reserve_list'][selected_date]
+        
+        # 加载配置
+        config = ConfigManager.load_config()
+        hide_ended = config.get('活动过滤设置', {}).get('hide_ended_reservations', False)
+        
+        # 过滤活动
+        filtered_activities = []
+        filtered_count = 0
+        
+        for activity in activities:
+            if hide_ended and activity.get('state') == 3:
+                filtered_count += 1
+                continue
+            filtered_activities.append(activity)
+        
+        if not filtered_activities:
+            if filtered_count > 0:
+                print(f"\n{selected_date} 没有可用的活动（已屏蔽 {filtered_count} 个已结束预约的活动）")
+            else:
+                print(f"\n{selected_date} 没有可用的活动")
+            input("按回车键返回主菜单...")
+            return None
+        
+        # 先显示活动信息表格
+        print(f"\n{selected_date} 活动信息：")
+        console = Console()
+        table = Table(show_header=True, header_style="bold magenta", box=None)
+        table.add_column("ID", style="cyan")
+        table.add_column("活动名称", style="green")
+        table.add_column("预约时间", style="yellow")
+        table.add_column("开始时间", style="blue")
+        table.add_column("类型", style="red")
+        
+        for activity in filtered_activities:
+            activity_id = activity['reserve_id']
+            title = activity['act_title'].replace('\n', '')
+            reserve_time_str = TimeUtils.timestamp_to_datetime(activity['reserve_begin_time'])
+            start_time_str = TimeUtils.timestamp_to_datetime(activity['act_begin_time'])
+            
+            # 处理活动提示信息
+            if '预约只是签售资格，现场签售需购买up主周边。' in activity['describe_info']:
+                warning = "⚠️ 付费内容"
+            else:
+                warning = "免费活动"
+            
+            table.add_row(
+                str(activity_id),
+                title,
+                reserve_time_str,
+                start_time_str,
+                warning
+            )
+        
+        with console.capture() as capture:
+            console.print(table)
+        print(f"\n{capture.get()}\n")
+        
+        # 显示过滤信息
+        if hide_ended and filtered_count > 0:
+            print(f"\n已屏蔽 {filtered_count} 个已结束预约的活动\n")
+        
+        # 然后显示选择菜单
         options = []
         activity_mapping = {}
         
-        activities = reservation_data.raw_data['reserve_list'][selected_date]
-        for i, activity in enumerate(activities):
+        for i, activity in enumerate(filtered_activities):
             activity_id = activity['reserve_id']
             title = activity['act_title'].replace('\n', '')
             reserve_time_str = TimeUtils.timestamp_to_datetime(activity['reserve_begin_time'])
             start_time_str = TimeUtils.timestamp_to_datetime(activity['act_begin_time'])
             if '预约只是签售资格，现场签售需购买up主周边。' in activity['describe_info']:
-                warning = "[包含付费内容] "
+                warning = "[需付费] "
             else:
                 warning = ""
             display_text = f"\033[31m{warning}\033[0m{title} | 预约开始 {reserve_time_str} | 活动时间 {start_time_str}"
             options.append(display_text)
             activity_mapping[i] = activity_id
         
-        if not options:
-            print(f"\n{selected_date} 没有可用的活动")
-            input("按回车键返回主菜单...")
-            return None
-        
-        selected_index = InteractiveMenu.show_menu(f"{selected_date} 活动列表", options)
+        selected_index = InteractiveMenu.show_menu(f"选择要预约的活动", options)
         if selected_index == -1:
             return None
         
@@ -927,7 +1108,7 @@ class UserInterface:
     @staticmethod
     def show_welcome_message() -> None:
         """显示欢迎信息"""
-        Logger.info("""
+        print("""
 ██████╗ ██╗    ██╗███████╗    ████████╗██╗ ██████╗██╗  ██╗███████╗████████╗
 ██╔══██╗██║    ██║██╔════╝    ╚══██╔══╝██║██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝
 ██████╔╝██║ █╗ ██║███████╗       ██║   ██║██║     █████╔╝ █████╗     ██║   
@@ -936,8 +1117,7 @@ class UserInterface:
 ╚═════╝  ╚══╝╚══╝ ╚══════╝       ╚═╝   ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   
         """)
         Logger.info(f'当前程序版本：{VERSION} | 本工具在 Starsbon/bws_ticket 开源，欢迎 Star！')
-        Logger.info('')
-    
+        Logger.info(f'不出意外这是本届 BW 2025 最后一版更新，我们 2026 有缘再会喵\n')
 
     
     @staticmethod
@@ -1007,26 +1187,6 @@ class UserInterface:
             except Exception as e:
                 Logger.error(f"登录过程中发生错误: {e}，请重试")
                 continue
-    
-    # @staticmethod
-    # def get_activity_selection(activity_mapping: Dict[int, Tuple[str, int, int]]) -> int:
-    #     """获取活动选择"""
-    #     while True:
-    #         try:
-    #             activity_input = input('输入活动代码：')
-    #             activity_id = int(activity_input)
-                
-    #             if activity_id not in activity_mapping:
-    #                 Logger.warning('选择不正确！请重新输入。')
-    #                 continue
-                
-    #             activity_title = activity_mapping[activity_id][0]
-    #             Logger.info(f'{activity_id}：{activity_title} 已选中')
-    #             return activity_id
-                
-    #         except ValueError:
-    #             Logger.warning('请输入有效的数字！')
-
 
 def main():
     """主函数"""
@@ -1047,45 +1207,68 @@ def main():
             Logger.error('账号信息错误或异常，请检查 网络/账号/Cookies 再试，详细报错见上方。')
             return
         
+        # 获取用户已预约的活动信息
+        try:
+            my_reservations = api_client.get_my_reservations()
+        except Exception as e:
+            Logger.warning(f"获取用户预约信息失败: {e}，将继续运行但无法过滤已预约活动")
+            my_reservations = None
+        
         # 初始化数据管理器
-        reservation_data = ReservationData(reservation_info)
+        reservation_data = ReservationData(reservation_info, my_reservations)
         
         # 主菜单循环
         while True:
             time_status = "NTP时间" if TimeUtils._use_ntp else "本地时间"
             config = ConfigManager.load_config()
             delay_ms = config.get('开票前延迟设置', {}).get('start_delay_ms', 0)
+            loop_delay_ms = config.get('开抢中延迟设置', {}).get('loop_delay_ms', 50)
+            hide_ended = config.get('活动过滤设置', {}).get('hide_ended_reservations', False)
+            filter_status = "已启用" if hide_ended else "已禁用"
             main_options = [
-                "查看所有活动信息",
-                "按日期查看活动",
+                "查看所有预约活动",
+                "查看指定日期活动",
+                "查看我的预约",
                 "开始预约抢票",
-                f"时间校时设置 (当前: {time_status})",
-                f"延时设置 (当前: {delay_ms}毫秒)",
-                "模拟测试 (6分钟倒计时测试)",
+                f"设置程序校时 (当前: {time_status})",
+                f"设置开抢前延迟 (当前: {delay_ms}毫秒)",
+                f"设置开抢中延迟 (当前: {loop_delay_ms}毫秒)",
+                f"设置屏蔽已结束活动 (当前: {filter_status})",
                 "退出程序"
             ]
             
             selected_index = InteractiveMenu.show_menu("BWS Ticket - 主菜单", main_options)
             
-            if selected_index == -1 or selected_index == 6:  # ESC或退出
+            if selected_index == -1 or selected_index == 8:  # ESC或退出
                 Logger.info("程序退出")
                 break
-            elif selected_index == 0:  # 查看所有活动信息
+            elif selected_index == 0:  # 查看所有预约活动
                 print("\n" + "="*60)
-                print("查看所有活动信息")
+                print("查看所有预约活动")
                 print("="*60)
                 reservation_data.display_ticket_info()
                 reservation_data.display_activities()
                 input("\n按回车键返回主菜单...")
-            elif selected_index == 4:  # 延时设置
+            elif selected_index == 2:  # 查看我的预约
+                print("\n" + "="*60)
+                print("查看我的预约")
+                print("="*60)
+                try:
+                    my_reservations = api_client.get_my_reservations()
+                    if my_reservations:
+                        ReservationData.display_my_reservations(my_reservations)
+                    else:
+                        Logger.error("获取预约信息失败")
+                except Exception as e:
+                    Logger.error(f"获取预约信息时出错: {e}")
+                input("\n按回车键返回主菜单...")
+            elif selected_index == 5:  # 设置开抢前延迟
                 try:
                     current_delay = config.get('开票前延迟设置', {}).get('start_delay_ms', 0)
                     print(f"\n当前延时设置: {current_delay} 毫秒")
-                    print("延时说明: 设置开票前延迟时间，正数为延迟（如100表示开票后100ms开抢），负数为提前（如-100表示提前100ms开抢）")
-                    print("例如: 输入800表示开票0.8秒后开始抢票，输入-200表示提前0.2秒开始抢票")
-                    print("注意: 提前抢票可能触发风控，延迟过长可能导致抢票失败")
+                    print("说明: 本设置影响开票前的动作，正数为延迟（如 100 表示开票后 100ms 开抢），负数为提前（如 -100 表示提前 100ms 开抢）\n")
                     
-                    delay_input = input(f"请输入新的延时时间（毫秒，支持负数，当前: {current_delay}）: ").strip()
+                    delay_input = input(f"请输入新的延时时间（毫秒）: ").strip()
                     
                     if delay_input == "":
                         Logger.info("未修改延时设置")
@@ -1104,41 +1287,68 @@ def main():
                     pass
                 
                 input("\n按回车键返回主菜单...")
-            elif selected_index == 5:  # 模拟测试
-                Logger.info("开始模拟测试 - 6分钟倒计时（包含5分钟自动校时）")
-                Logger.info("注意：这是测试模式，不会执行真正的抢票操作")
-                
-                # 使用 inquirer 进行确认
+            elif selected_index == 6:  # 设置开抢中延迟
                 try:
-                    confirm_question = [
-                        inquirer.Confirm('confirm',
-                                       message="确认开始模拟测试？",
-                                       default=False)
-                    ]
-                    confirm_answer = inquirer.prompt(confirm_question)
+                    current_delay = config.get('开抢中延迟设置', {}).get('loop_delay_ms', 50)
+                    print(f"\n当前开抢中延迟设置: {current_delay} 毫秒")
+                    print("说明: 本设置影响开抢过程中每次请求之间的延迟时间，设置为0表示不进行延迟，只允许非负数\n")
                     
-                    if confirm_answer and confirm_answer['confirm']:
-                        print("\n" + "="*60)
-                        Logger.info("开始模拟测试")
-                        Logger.info("模拟活动：测试活动")
-                        Logger.info("模拟模式：准时开抢（6分钟倒计时）")
-                        Logger.info("按 Ctrl+C 可以中断测试\n")
-                        
-                        # 创建模拟的预约时间（当前时间 + 6分钟）
-                        current_time = int(TimeUtils.get_current_time())
-                        mock_reserve_time = current_time + 360  # 6分钟 = 360秒
-                         
-                        # 创建临时的ReservationBot实例用于测试
-                        test_bot = ReservationBot(api_client, reservation_data)
-                         
-                        # 执行模拟测试
-                        test_bot._simulate_wait_for_reservation_time("TEST123", 99999, "测试活动", mock_reserve_time)
+                    delay_input = input(f"请输入新的开抢中延迟时间（毫秒，>=0）: ").strip()
+                    
+                    if delay_input == "":
+                        Logger.info("未修改开抢中延迟设置")
+                    else:
+                        new_delay = int(delay_input)
+                        if new_delay < 0:
+                            Logger.warning("开抢中延迟不能为负数，请输入大于等于0的数值")
+                        else:
+                            if '开抢中延迟设置' not in config:
+                                config['开抢中延迟设置'] = {}
+                            config['开抢中延迟设置']['loop_delay_ms'] = new_delay
+                            ConfigManager.save_config(config)
+                            if new_delay == 0:
+                                Logger.info(f"开抢中延迟已设置为: {new_delay} 毫秒（无延迟）")
+                            else:
+                                Logger.info(f"开抢中延迟已设置为: {new_delay} 毫秒")
+                            
+                except ValueError:
+                    Logger.warning("请输入有效的数字")
+                except (KeyboardInterrupt, EOFError):
+                    pass
+                
+                input("\n按回车键返回主菜单...")
+            elif selected_index == 7:  # 设置屏蔽已结束活动
+                try:
+                    current_hide = config.get('活动过滤设置', {}).get('hide_ended_reservations', False)
+                    status_text = "已启用" if current_hide else "已禁用"
+                    print(f"\n当前设置: 屏蔽已结束预约活动 - {status_text}")
+                    print("说明: 启用后将为您隐藏不可预约的活动（含已预约成功的活动）")
+                    
+                    filter_options = [
+                        "禁用屏蔽 - 显示所有活动",
+                        "启用屏蔽 - 隐藏已结束预约、已预约的活动"
+                    ]
+                    
+                    current_option = 1 if current_hide else 0
+                    filter_selected = InteractiveMenu.show_menu("活动过滤设置", filter_options, current_option)
+                    
+                    if filter_selected == -1:
+                        pass  # 用户取消
+                    elif filter_selected == 0:
+                        config['活动过滤设置']['hide_ended_reservations'] = False
+                        ConfigManager.save_config(config)
+                        Logger.info("已禁用活动过滤，将显示所有活动")
+                    elif filter_selected == 1:
+                        config['活动过滤设置']['hide_ended_reservations'] = True
+                        ConfigManager.save_config(config)
+                        Logger.info("已启用活动过滤，将屏蔽已结束预约和已预约的活动")
                         
                 except (KeyboardInterrupt, EOFError):
                     pass
                 
-                input("\n测试结束，按回车键返回主菜单...")
-            elif selected_index == 1:  # 按日期查看活动
+                input("\n按回车键返回主菜单...")
+
+            elif selected_index == 1:  # 查看指定日期活动
                 selected_date = InteractiveMenu.show_date_menu(reservation_data)
                 if selected_date:
                     print("\n" + "="*60)
@@ -1146,7 +1356,7 @@ def main():
                     print("="*60)
                     reservation_data.display_activities_for_date(selected_date)
                     input("\n按回车键返回主菜单...")
-            elif selected_index == 2:  # 开始预约抢票
+            elif selected_index == 3:  # 开始预约抢票
                 # 选择日期
                 selected_date = InteractiveMenu.show_date_menu(reservation_data)
                 if not selected_date:
@@ -1166,13 +1376,6 @@ def main():
                 activity_title = reservation_data.activity_mapping[selected_activity_id][0]
                 mode_text = "准时开抢" if reservation_mode == "scheduled" else "直接开抢"
                 
-                # print("\n" + "="*60)
-                # print("预约确认")
-                # print("="*60)
-                # print(f"活动名称：{activity_title}")
-                # print(f"预约模式：{mode_text}")
-                # print("按 Ctrl+C 可以中断抢票")
-                
                 # 使用 inquirer 进行确认
                 try:
                     confirm_question = [
@@ -1189,15 +1392,15 @@ def main():
                 
                 # 开始预约
                 print("\n" + "="*60)
-                Logger.info(f"开始预约：{activity_title}")
-                Logger.info(f"预约模式：{mode_text}")
+                Logger.info(f"当前项目：{activity_title}")
+                Logger.info(f"当前模式：{mode_text}")
                 Logger.info("按 Ctrl+C 可以中断抢票\n")
                 
                 bot = ReservationBot(api_client, reservation_data)
                 bot.wait_and_reserve(selected_activity_id, reservation_mode)
                 
                 input("\n预约结束，按回车键返回主菜单...")
-            elif selected_index == 3:  # 时间校时设置
+            elif selected_index == 4:  # 设置程序校时
                 time_options = [
                     "使用本地时间",
                     "使用 Aliyun NTP 时间"
@@ -1212,7 +1415,7 @@ def main():
                     TimeUtils.set_ntp_mode(False)
                     Logger.info("已切换到本地时间模式")
                 elif time_selected == 1:
-                    Logger.info("正在进行NTP校时...")
+                    Logger.info("正在进行 NTP 校时...")
                     TimeUtils.set_ntp_mode(True)
                 
                 input("\n按回车键返回主菜单...")
